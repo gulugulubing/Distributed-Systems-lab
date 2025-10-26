@@ -23,7 +23,37 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskType int
 
+const (
+	MapTask TaskType = iota
+	ReduceTask
+	Wait
+	Exit
+)
+
+type GetTaskArgs struct{}
+
+type GetTaskReply struct {
+	TaskType TaskType
+	// For map task, id is from 0 to len(input files) - 1
+	// For reduce task, id is from 0 to NReduce - 1
+	// One reduce task may have more than one keys
+	TaskId int
+	// for map task
+	FilePath string
+	NReduce  int
+
+	// for reduce
+	NMap int // overall map task num(the num of file need to read)
+}
+
+type ReportTaskArgs struct {
+	TaskType TaskType
+	TaskId   int
+}
+
+type ReportTaskReply struct{}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
