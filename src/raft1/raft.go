@@ -7,14 +7,14 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
+	"bytes"
 	"fmt"
-	//	"bytes"
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -109,12 +109,19 @@ func (rf *Raft) GetState() (int, bool) {
 func (rf *Raft) persist() {
 	// Your code here (3C).
 	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// raftstate := w.Bytes()
-	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	if err := e.Encode(rf.currentTerm); err != nil {
+		fmt.Println("encoding fails")
+	}
+	if err := e.Encode(rf.votedFor); err != nil {
+		fmt.Println("encoding fails")
+	}
+	if err := e.Encode(rf.log); err != nil {
+		fmt.Println("encoding fails")
+	}
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 // restore previously persisted state.
@@ -123,18 +130,19 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (3C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var log []LogEntry
+	var currentTerm int
+	var votedFor int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		fmt.Println("readPersist fails")
+	} else {
+		rf.votedFor = votedFor
+		rf.currentTerm = currentTerm
+		rf.log = log
+		// fmt.Printf("read server %d votedFor %d currentTerm %d\n", rf.me, votedFor, rf.currentTerm)
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -194,47 +202,43 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		// see a new term
 		rf.votedFor = -1
-		if rf.Role != follower {
-			rf.Role = follower
-			//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-			//	"degraded to follower",
-			//	fmt.Sprintf("reiecve HB with new term: %d", args.Term))
-		}
+		rf.Role = follower
 	}
 	rf.currentTerm = args.Term
+	rf.persist()
 	reply.Term = rf.currentTerm
 
-	if args.LastLogTerm > rf.log[len(rf.log)-1].Term && rf.votedFor == -1 {
+	if args.LastLogTerm > rf.log[len(rf.log)-1].Term && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		// candid's log is more up-to-date than follower
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		// fmt.Printf("term %d candidate %d, vote granted\n", rf.currentTerm, rf.votedFor)
 		tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-			fmt.Sprintf("Vote for: %d", rf.votedFor),
-			fmt.Sprintf("Server %d term %d time %v", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000")))
-		if rf.Role != follower {
-			rf.Role = follower
-		}
+			fmt.Sprintf("S%d, VoteFor: %d, term: %d", rf.me, rf.votedFor, rf.currentTerm),
+			fmt.Sprintf("because cand's lastLog term is %d while my term is %d", args.LastLogTerm, rf.log[len(rf.log)-1].Term))
+
+		rf.Role = follower
 		rf.resetElectionTimer()
 		return
 	}
 
-	if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1 && rf.votedFor == -1 {
+	if args.LastLogTerm == rf.log[len(rf.log)-1].Term && args.LastLogIndex >= len(rf.log)-1 && (rf.votedFor == -1 || rf.votedFor == args.CandidateId) {
 		// candid's log is also more up-date-to follower
 		rf.votedFor = args.CandidateId
+		rf.persist()
 		reply.VoteGranted = true
 		// fmt.Printf("term %d candidate %d, vote granted\n", rf.currentTerm, rf.votedFor)
 		tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-			fmt.Sprintf("Vote for: %d", rf.votedFor),
-			fmt.Sprintf("Server %d term %d time %v", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000")))
-		if rf.Role != follower {
-			rf.Role = follower
-		}
+			fmt.Sprintf("S%d, VoteFor: %d, term: %d", rf.me, rf.votedFor, rf.currentTerm),
+			fmt.Sprintf("because cand's lastLog term is %d while my term is %d", args.LastLogTerm, rf.log[len(rf.log)-1].Term))
+
+		rf.Role = follower
 		rf.resetElectionTimer()
 		return
 	}
 	// candid's log is too old to win vote
-	rf.resetElectionTimer()
+	// shouldn't reset electionTime here, because rejecting the vote
 	reply.VoteGranted = false
 }
 
@@ -308,12 +312,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			rf.votedFor = -1
 			rf.currentTerm = args.Term
-			reply.Success = true
-			rf.resetElectionTimer()
-		} else {
-			reply.Success = true
-			rf.resetElectionTimer()
+			rf.persist()
 		}
+		reply.Success = true
+		rf.resetElectionTimer()
 
 		// heartbeat时看到新的
 		if args.LeaderCommit < len(rf.log) && args.LeaderCommitTerm == rf.log[args.LeaderCommit].Term {
@@ -352,10 +354,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 			rf.votedFor = -1
 			rf.currentTerm = args.Term
-			rf.resetElectionTimer()
-		} else {
-			rf.resetElectionTimer()
+			rf.persist()
 		}
+		rf.resetElectionTimer()
 		// then handle log
 
 		if args.PrevLogIndex >= len(rf.log) {
@@ -387,11 +388,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 		// preLog match
 		if args.PrevLogIndex+len(args.Entries) < len(rf.log) {
+			isConflict := false
 			for i := args.PrevLogIndex + 1; i <= args.PrevLogIndex+len(args.Entries); i++ {
-				rf.log[i] = args.Entries[i-args.PrevLogIndex-1]
+				if rf.log[i].Term != args.Entries[i-args.PrevLogIndex-1].Term {
+					rf.log[i] = args.Entries[i-args.PrevLogIndex-1]
+					isConflict = true
+				}
 				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 				//	fmt.Sprintf("Follower appended log idx %d", i),
 				//	fmt.Sprintf("Log length %d", len(rf.log)))
+			}
+			if isConflict {
+				rf.log = rf.log[:args.PrevLogIndex+len(args.Entries)+1]
 			}
 		} else {
 			rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
@@ -399,6 +407,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			//	fmt.Sprintf("Follower appended log from idx %d", args.PrevLogIndex+1),
 			//	fmt.Sprintf("Log length %d, last command %v", len(rf.log), rf.log[len(rf.log)-1].Command))
 		}
+		rf.persist()
 		reply.Success = true
 
 		preCommitIdx := rf.commitIndex
@@ -410,9 +419,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				applyMsg.Command = rf.log[commitIdx].Command
 				applyMsg.CommandIndex = commitIdx
 
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	fmt.Sprintf("Follower applied log %d  Term %v comm %v", commitIdx, rf.log[commitIdx].Term, applyMsg.Command),
-				//	fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
+				tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+					fmt.Sprintf("Follower applied log %d  Term %v comm %v", commitIdx, rf.log[commitIdx].Term, applyMsg.Command),
+					fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
 
 				rf.applyCh <- applyMsg
 				rf.lastApplied = commitIdx
@@ -455,11 +464,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term = rf.currentTerm
 	isLeader = true
 	rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
-
+	rf.persist()
 	ch := make(chan appendRelyInfo, len(rf.peers)-1)
 	//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-	//	fmt.Sprintf("Lead send APE last comm %d term %d idx %d", rf.log[len(rf.log)-1].Command, rf.log[len(rf.log)-1].Term, len(rf.log)-1),
-	//	fmt.Sprintf("pre com %v term %d idx %d", rf.log[len(rf.log)-2].Command, rf.log[len(rf.log)-2].Term, len(rf.log)-2))
+	//	fmt.Sprintf("Leader send APE last comm %d term %d idx %d", rf.log[len(rf.log)-1].Command, rf.log[len(rf.log)-1].Term, len(rf.log)-1),
+	//fmt.Sprintf("pre com %v term %d idx %d", rf.log[len(rf.log)-2].Command, rf.log[len(rf.log)-2].Term, len(rf.log)-2))
+	//	fmt.Sprintf(""))
 	rf.sendAPE(ch)
 	go rf.processAPE(ch)
 
@@ -510,6 +520,7 @@ func (rf *Raft) ticker() {
 
 				rf.currentTerm = rf.currentTerm + 1
 				rf.votedFor = rf.me
+				rf.persist()
 				rf.resetElectionTimer()
 
 				ch := make(chan voteInfo, len(rf.peers)-1)
@@ -534,7 +545,7 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		// pause for a random amount of time between 10 and 50
 		// milliseconds.
-		ms := 10 + (rand.Int63() % 40)
+		ms := 5 + (rand.Int63() % 5)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
@@ -552,8 +563,7 @@ func (rf *Raft) startElection(ch chan voteInfo) {
 		}
 		go func(i int, ch chan voteInfo) {
 			requestVoteReply := &RequestVoteReply{}
-			ok := rf.sendRequestVote(i, requestVoteArgs, requestVoteReply)
-			if ok {
+			if ok := rf.sendRequestVote(i, requestVoteArgs, requestVoteReply); ok {
 				ch <- voteInfo{requestVoteReply.Term, requestVoteReply.VoteGranted}
 			}
 		}(i, ch)
@@ -570,12 +580,21 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 			if rf.Role == candidate {
 				if v.term > rf.currentTerm {
 					// degrade to follower
-					if rf.Role != follower {
-						rf.currentTerm = v.term
-						rf.Role = follower
-						rf.votedFor = -1
-						rf.resetElectionTimer()
-					}
+					tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+						"degraded to follower process ElectionResult",
+						fmt.Sprintf("server %d is leader %v, term %d, but reply term: %d", rf.me, rf.Role, rf.currentTerm, v.term))
+					rf.currentTerm = v.term
+					rf.Role = follower
+					rf.votedFor = -1
+					rf.persist()
+					rf.resetElectionTimer()
+
+					rf.mu.Unlock()
+					break
+				}
+				if v.term < rf.currentTerm {
+					rf.mu.Unlock()
+					break
 				}
 				if v.voteGranted {
 					// fmt.Printf("Election for me %v\n", rf.me)
@@ -621,8 +640,9 @@ func (rf *Raft) sendHeartBeat(ch chan appendRelyInfo) {
 		}
 		go func(i int, ch chan appendRelyInfo) {
 			reply := &AppendEntriesReply{}
-			rf.sendAppendEntries(i, args, reply)
-			ch <- appendRelyInfo{reply.Term, reply.Success, i, -1}
+			if ok := rf.sendAppendEntries(i, args, reply); ok {
+				ch <- appendRelyInfo{reply.Term, reply.Success, i, -1}
+			}
 		}(i, ch)
 	}
 }
@@ -635,15 +655,18 @@ func (rf *Raft) processHeartbeatResult(ch chan appendRelyInfo) {
 			rf.mu.Lock()
 			if !a.success && a.term > rf.currentTerm {
 				// become follower
+				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+				//	"degraded to follower",
+				//	fmt.Sprintf("server %d is leader %v, term %d, but heartbeart reply term: %d", rf.me, rf.Role, rf.currentTerm, a.term))
 				tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 					"degraded to follower",
 					fmt.Sprintf("server %d is leader %v, term %d, but heartbeart reply term: %d", rf.me, rf.Role, rf.currentTerm, a.term))
-				if rf.Role == leader {
-					rf.currentTerm = a.term
-					rf.Role = follower
-					rf.votedFor = -1
-					rf.resetElectionTimer()
-				}
+				rf.currentTerm = a.term
+				rf.Role = follower
+				rf.votedFor = -1
+				rf.persist()
+				rf.resetElectionTimer()
+
 				rf.mu.Unlock()
 				break
 			}
@@ -669,9 +692,14 @@ func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
 		args.Term = rf.currentTerm
 		args.LeaderId = rf.me
 		args.PrevLogIndex = rf.nextIndex[peer] - 1
-		//fmt.Println(peer, args.PrevLogIndex, len(rf.log), rf.me, rf.currentTerm)
+		// fmt.Println(peer, args.PrevLogIndex, len(rf.log), rf.me, rf.currentTerm)
 		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
-		args.Entries = rf.log[rf.nextIndex[peer]:]
+		// args.Entries = rf.log[rf.nextIndex[peer]:]
+		if len(rf.log) > rf.nextIndex[peer] {
+			entriesToCopy := rf.log[rf.nextIndex[peer]:]
+			args.Entries = make([]LogEntry, len(entriesToCopy))
+			copy(args.Entries, entriesToCopy) // 关键：复制数据到新切片
+		}
 		args.LeaderCommit = rf.commitIndex
 		args.LeaderCommitTerm = rf.log[rf.commitIndex].Term
 		go func(i int, ch chan appendRelyInfo) {
@@ -684,20 +712,15 @@ func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
 				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 				//fmt.Sprintf("leader %d recive APERply from %d replyOk %v sucess %v\n", rf.me, peer, ok, reply.Success),
 				//fmt.Sprintf("Am I leader %d, Am I dead %d, term %d", rf.Role, rf.dead, rf.currentTerm))
-				/*
-					startWaitReply := time.Now()
-					for !ok {
-						ok = rf.sendAppendEntries(peer, args, reply)
-						time.Sleep(10 * time.Millisecond)
-						if elapsed := time.Since(startWaitReply); elapsed > 300*time.Second {
-							// if the leader can Not get the reply from follower, it should not modify anything below
-							return
-						}
-					}*/
-
-				if !ok {
-					// if the leader can Not get the reply from follower, it should not modify anything below
-					return
+				startWaitReply := time.Now()
+				for !ok && rf.killed() == false {
+					// 3C中可能server是挂了，再重启，所以要持续发送
+					ok = rf.sendAppendEntries(peer, args, reply)
+					time.Sleep(10 * time.Millisecond)
+					if elapsed := time.Since(startWaitReply); elapsed > 300*time.Second {
+						// if the leader can Not get the reply from follower, it should not modify anything below
+						return
+					}
 				}
 
 				if reply.Success {
@@ -734,10 +757,15 @@ func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
 								// follower's conflict term not found in leader
 								rf.nextIndex[peer] = reply.Xindex
 							} else {
-								rf.nextIndex[peer] = left - 1
+								rf.nextIndex[peer] = left
 							}
 						}
 						args.PrevLogIndex = rf.nextIndex[peer] - 1
+						if args.PrevLogIndex > len(rf.log) || args.PrevLogIndex < 0 {
+							//fmt.Printf("reply Xlen %d, reply Xindex %d, PrevLogIndex %d, lenOfLOG %d\n", reply.Xlen, reply.Xindex, args.PrevLogIndex, len(rf.log))
+							rf.mu.Unlock()
+							return
+						}
 						args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
 						args.Entries = rf.log[rf.nextIndex[peer]:]
 						args.LeaderCommit = rf.commitIndex
@@ -752,33 +780,44 @@ func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
 
 func (rf *Raft) processAPE(ch chan appendRelyInfo) {
 	timeout := time.After(300 * time.Second)
-	matchCnt := 1
 	for rf.killed() == false {
 		select {
 		case a := <-ch:
 			rf.mu.Lock()
-			if !a.success && a.term > rf.currentTerm {
+			if !a.success {
 				// become follower
-				tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-					"degraded to follower",
-					fmt.Sprintf("server %d is leader %v, term %d, but heartbeart reply term: %d", rf.me, rf.Role, rf.currentTerm, a.term))
-				if rf.Role == leader {
-					rf.currentTerm = a.term
+				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+				//	"degraded to follower",
+				//	fmt.Sprintf("server %d is leader %v, term %d, but heartbeart reply term: %d", rf.me, rf.Role, rf.currentTerm, a.term))
+				if a.term > rf.currentTerm {
+					tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+						"degraded to follower When processAPE",
+						fmt.Sprintf("My role is %d, my term is %d, but I reiecve term from : %d", rf.Role, rf.currentTerm, a.term))
 					rf.Role = follower
+					rf.currentTerm = a.term
 					rf.votedFor = -1
+					rf.persist()
+
 					rf.resetElectionTimer()
 				}
 				rf.mu.Unlock()
 				break
 			} else {
 				// fmt.Println(a.peer, a.lastAPEIdx)
+				if a.lastAPEIdx > len(rf.log)-1 {
+					fmt.Println("this leader became follower and its log has been truncated")
+					rf.mu.Unlock()
+					break
+				}
 				rf.nextIndex[a.peer] = a.lastAPEIdx + 1
 				rf.matchIndex[a.peer] = a.lastAPEIdx
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//fmt.Sprintf("Leader knew follower %d append last log %d", a.peer, a.lastAPEIdx),
-				//fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
+
+				tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+					fmt.Sprintf("Leader knew follower %d append last log %d com: %v", a.peer, a.lastAPEIdx, rf.log[a.lastAPEIdx].Command),
+					fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
 				if a.lastAPEIdx > rf.commitIndex {
 					// 出现了一个新的可能已经在大部分follower得到复制的log
+					matchCnt := 1
 					for peer := range rf.matchIndex {
 						if peer == rf.me {
 							continue
@@ -790,7 +829,8 @@ func (rf *Raft) processAPE(ch chan appendRelyInfo) {
 					if matchCnt > len(rf.peers)/2 && rf.log[a.lastAPEIdx].Term == rf.currentTerm {
 						preCommitIdx := rf.commitIndex
 						rf.commitIndex = a.lastAPEIdx
-
+						//fmt.Printf("📌 Leader %d commitIndex: %d commd %d at (current term %d)\n",
+						//	rf.me, rf.commitIndex, rf.log[rf.commitIndex].Command, rf.currentTerm)
 						for commitIdx := preCommitIdx + 1; commitIdx <= rf.commitIndex; commitIdx++ {
 							applyMsg := raftapi.ApplyMsg{}
 							applyMsg.CommandValid = true
@@ -839,6 +879,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+	//"server boots",
+	//fmt.Sprintf("server %d is in term %d logLen %d with lastLogTerm %d", rf.me, rf.currentTerm, len(rf.log), rf.log[len(rf.log)-1].Term))
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
