@@ -790,10 +790,8 @@ func (rf *Raft) ticker() {
 		} else {
 			if elapsed := time.Since(rf.lastHeartbeatTime); elapsed > 100*time.Millisecond {
 				// lab的hint里说测试会要求heartbeat是100ms，但我没想明白为什么测试可以控制hb，不得是我的代码里控制的么
-				heartbeatCh := make(chan appendRelyInfo, len(rf.peers)-1)
-				rf.sendHeartBeat(heartbeatCh)
+				rf.sendHeartBeat()
 				rf.lastHeartbeatTime = time.Now()
-				go rf.processHeartbeatResult(heartbeatCh)
 
 				apeCh := make(chan appendRelyInfo, len(rf.peers)-1)
 				rf.sendAPE(apeCh)
@@ -883,11 +881,9 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 					if voteCount > len(rf.peers)/2 && v.term == rf.currentTerm {
 						// maybe old term vote come, so need to check term here
 						rf.Role = leader
-						ch := make(chan appendRelyInfo, len(rf.peers)-1)
 						rf.nextIndex = make([]int, len(rf.peers))
 						rf.matchIndex = make([]int, len(rf.peers))
-						rf.sendHeartBeat(ch)
-						go rf.processHeartbeatResult(ch)
+						rf.sendHeartBeat()
 						// fmt.Printf("S%d win leader at term %d %v\n", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000"))
 						// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "I win Leader", fmt.Sprintf("Server %d term %d at %v", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000")))
 						for i := 0; i < len(rf.peers); i++ {
@@ -908,7 +904,7 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 	}
 }
 
-func (rf *Raft) sendHeartBeat(ch chan appendRelyInfo) {
+func (rf *Raft) sendHeartBeat() {
 	args := &AppendEntriesArgs{}
 	args.Term = rf.currentTerm
 	args.LeaderId = rf.me
@@ -923,46 +919,23 @@ func (rf *Raft) sendHeartBeat(ch chan appendRelyInfo) {
 			continue
 		}
 		if rf.logStartIndex+len(rf.log)-1 >= rf.nextIndex[peer] {
-			// will send an ape soon, no need to heartbeat
+			// will send an APE soon, no need to heartbeat
 			continue
 		}
-		go func(i int, ch chan appendRelyInfo) {
+		go func(i int) {
 			reply := &AppendEntriesReply{}
 			if ok := rf.sendAppendEntries(i, args, reply); ok {
-				ch <- appendRelyInfo{reply.Term, reply.Success, i, -1}
-			}
-		}(peer, ch)
-	}
-}
-
-func (rf *Raft) processHeartbeatResult(ch chan appendRelyInfo) {
-	timeout := time.After(300 * time.Second)
-	for rf.killed() == false {
-		select {
-		case a := <-ch:
-			rf.mu.Lock()
-			if !a.success && a.term > rf.currentTerm {
-				// become follower
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	"degraded to follower",
-				// fmt.Printf("S%d degradted to follower due recieve a new term %d to old term %d at %v\n", rf.Role, a.term, rf.currentTerm, time.Now().Format("15:04:05.000"))
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	"degraded to follower",
-				//	fmt.Sprintf("s%d is leader, term %d, but heartbeart reply term: %d", rf.me, rf.currentTerm, a.term))
-				rf.currentTerm = a.term
-				rf.Role = follower
-				rf.votedFor = -1
-				rf.persist(nil)
-				rf.resetElectionTimer()
-
+				rf.mu.Lock()
+				if !reply.Success && reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.Role = follower
+					rf.votedFor = -1
+					rf.persist(nil)
+					rf.resetElectionTimer()
+				}
 				rf.mu.Unlock()
-				break
 			}
-			rf.mu.Unlock()
-		case <-timeout:
-			close(ch)
-			break
-		}
+		}(peer)
 	}
 }
 
