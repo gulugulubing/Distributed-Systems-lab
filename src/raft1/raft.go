@@ -71,8 +71,8 @@ type Raft struct {
 	lastIncludedTerm int
 
 	// for serialize apply
-	applyCond      *sync.Cond
-	applyingLogCnt int // tell installed snapshot apply wait
+	applyCond     *sync.Cond
+	isApplyingLog bool // tell installed snapshot apply wait
 }
 
 // 在初始化每个 Raft 节点时调用
@@ -85,7 +85,7 @@ func (rf *Raft) initRand() {
 
 // 然后在需要生成随机超时的地方使用这个实例
 func (rf *Raft) resetElectionTimer() {
-	randomRange := 800 // 600ms 的随机范围
+	randomRange := 600 // 600ms 的随机范围
 	baseTimeout := 500 // 基础超时 500ms
 	// 这里要比论文的大，因为heartbeat时间在这里测试100ms一次
 	timeoutMs := baseTimeout + rf.rdSeed.Intn(randomRange)
@@ -304,7 +304,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		return
 	}
 
-	for rf.applyingLogCnt > 0 {
+	for rf.isApplyingLog {
 		// fmt.Printf("S%d waiting install snap lastIncludedIndex: %d %v\n", rf.me, args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
 		//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 		//"waiting install snapshot",
@@ -338,7 +338,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.mu.Unlock()
 		return
 	}
-
+	rf.isApplyingLog = true
 	rf.applyCond.L.Unlock()
 
 	msg := raftapi.ApplyMsg{}
@@ -348,6 +348,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	msg.SnapshotTerm = args.LastIncludedTerm
 	msg.SnapshotIndex = args.LastIncludedIndex
 	rf.applyCh <- msg
+
+	rf.mu.Lock()
+	rf.isApplyingLog = false
+	rf.mu.Unlock()
+	rf.applyCond.Broadcast()
 	// fmt.Printf("S%d finish install snap lastIncludedIndex: %d %v", rf.me, args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
 	//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 	//	"finish install snapshot",
@@ -497,14 +502,6 @@ type AppendEntriesReply struct {
 	Xlen   int
 }
 
-type appendRelyInfo struct {
-	term    int
-	success bool
-	// used for APE, tell the leader which follower has appended its logs
-	peer       int
-	lastAPEIdx int
-}
-
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	if args.Entries == nil { // This a heartBeat
@@ -529,55 +526,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		rf.resetElectionTimer()
 
-		// heartbeat时看到新的
+		// heartbeat时看到新的,因为heartbeat这里preLog检验匹配，所以这里就检验args.leaderCommit了
 		if args.LeaderCommit < rf.logStartIndex+len(rf.log) && args.LeaderCommit-rf.logStartIndex >= 0 && args.LeaderCommitTerm == rf.log[args.LeaderCommit-rf.logStartIndex].Term {
-			preCommitIdx := rf.commitIndex
-			var msgs []raftapi.ApplyMsg
 			if args.LeaderCommit > rf.commitIndex {
 				rf.commitIndex = args.LeaderCommit
-				for commitIdx := preCommitIdx + 1; commitIdx <= rf.commitIndex; commitIdx++ {
-					applyMsg := raftapi.ApplyMsg{}
-					applyMsg.CommandValid = true
-					applyMsg.Command = rf.log[commitIdx-rf.logStartIndex].Command
-					applyMsg.CommandIndex = commitIdx
-					// fmt.Printf("S%d inHB commit index: %d startIndex: %d len: %d comm: %d %v\n", rf.me, commitIdx, rf.logStartIndex, len(rf.log), applyMsg.Command, time.Now().Format("15:04:05.000"))
-					msgs = append(msgs, applyMsg)
-				}
-				// fmt.Println("=====================")
-				rf.applyingLogCnt++
-				rf.mu.Unlock()
-
-				if len(msgs) == 0 {
-					return
-				}
-
-				rf.applyCond.L.Lock()
-				for msgs[0].CommandIndex != rf.lastApplied+1 {
-					rf.applyCond.Wait()
-				}
-				rf.applyCond.L.Unlock()
-
-				for _, msg := range msgs {
-					// fmt.Printf("S%d,send apply msg in HB idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-					rf.applyCh <- msg
-					/*
-						rf.mu.Lock()
-						rf.lastApplied = msg.CommandIndex
-						rf.mu.Unlock()
-					*/
-					// fmt.Printf("S%d,after sending apply msg in HB idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-				}
-				rf.mu.Lock()
-				rf.lastApplied = msgs[len(msgs)-1].CommandIndex
-				rf.applyingLogCnt--
-				rf.mu.Unlock()
 				rf.applyCond.Broadcast()
-			} else {
-				rf.mu.Unlock()
 			}
-		} else {
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 	} else {
 		if args.Term < rf.currentTerm { // tell the sender: your term is too old
 			reply.Term = rf.currentTerm
@@ -659,50 +615,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.persist(nil)
 		// fmt.Printf("S%d rev APE PrevlogIdx %d apeLogLen %d lastComm %d %v at logStartIdx %d, now len:%d\n", rf.me, args.PrevLogIndex, len(args.Entries), args.Entries[len(args.Entries)-1].Command, time.Now().Format("15:04:05.000"), rf.logStartIndex, len(rf.log))
 		reply.Success = true
-
-		preCommitIdx := rf.commitIndex
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(rf.logStartIndex+len(rf.log)-1, args.LeaderCommit)
-			var msgs []raftapi.ApplyMsg
-			for commitIdx := preCommitIdx + 1; commitIdx <= rf.commitIndex; commitIdx++ {
-				applyMsg := raftapi.ApplyMsg{}
-				applyMsg.CommandValid = true
-				applyMsg.Command = rf.log[commitIdx-rf.logStartIndex].Command
-				applyMsg.CommandIndex = commitIdx
-				// fmt.Printf("S%d inAPE commit index: %d startIndex: %d len: %d comm: %d %v\n", rf.me, commitIdx, rf.logStartIndex, len(rf.log), applyMsg.Command, time.Now().Format("15:04:05.000"))
-				msgs = append(msgs, applyMsg)
-			}
-			// fmt.Println("=====================")
-			rf.applyingLogCnt++
-			rf.mu.Unlock()
-
-			if len(msgs) == 0 {
-				return
-			}
-			rf.applyCond.L.Lock()
-			for msgs[0].CommandIndex != rf.lastApplied+1 {
-				rf.applyCond.Wait()
-			}
-			rf.applyCond.L.Unlock()
-
-			for _, msg := range msgs {
-				// fmt.Printf("S%d,send apply msg in APE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-				rf.applyCh <- msg
-				/*
-					rf.mu.Lock()
-					rf.lastApplied = msg.CommandIndex
-					rf.mu.Unlock()
-				*/
-				// fmt.Printf("S%d,after sending apply msg in APE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-			}
-			rf.mu.Lock()
-			rf.lastApplied = msgs[len(msgs)-1].CommandIndex
-			rf.applyingLogCnt--
-			rf.mu.Unlock()
 			rf.applyCond.Broadcast()
-		} else {
-			rf.mu.Unlock()
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -792,10 +709,7 @@ func (rf *Raft) ticker() {
 				// lab的hint里说测试会要求heartbeat是100ms，但我没想明白为什么测试可以控制hb，不得是我的代码里控制的么
 				rf.sendHeartBeat()
 				rf.lastHeartbeatTime = time.Now()
-
-				apeCh := make(chan appendRelyInfo, len(rf.peers)-1)
-				rf.sendAPE(apeCh)
-				go rf.processAPE(apeCh)
+				rf.sendAPE()
 
 				for peer := range rf.peers {
 					if peer == rf.me {
@@ -803,26 +717,54 @@ func (rf *Raft) ticker() {
 					}
 					if rf.nextIndex[peer] < rf.logStartIndex {
 						go rf.sendInstallSnapshot(peer)
-					} else {
-						if rf.logStartIndex+len(rf.log)-1 < rf.nextIndex[peer] {
-							// last index < nextIndex, no need to send ape, send heartbeat
-
-						} else {
-							// send APE
-						}
 					}
 				}
 			}
 		}
 
 		rf.mu.Unlock()
-		// pause for a random amount of time between 10 and 50
+		// pause for a random amount of time between 10 and 20
 		// milliseconds.
-		ms := 5 + (rand.Int63() % 5)
+		ms := 10 + (rand.Int63() % 10)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
 }
 
+func (rf *Raft) applyTicker() {
+	for rf.killed() == false {
+		rf.mu.Lock()
+		for (rf.lastApplied >= rf.commitIndex || rf.isApplyingLog) && !rf.killed() {
+			rf.applyCond.Wait()
+		}
+		if rf.killed() {
+			rf.mu.Unlock()
+			return
+		}
+
+		var msgs []raftapi.ApplyMsg
+		for commitIdx := rf.lastApplied + 1; commitIdx <= rf.commitIndex; commitIdx++ {
+			applyMsg := raftapi.ApplyMsg{}
+			applyMsg.CommandValid = true
+			applyMsg.Command = rf.log[commitIdx-rf.logStartIndex].Command
+			applyMsg.CommandIndex = commitIdx
+			// fmt.Printf("S%d commit index: %d comm: %d %v\n", rf.me, commitIdx, applyMsg.Command, time.Now().Format("15:04:05"))
+			msgs = append(msgs, applyMsg)
+		}
+		rf.isApplyingLog = true
+		rf.mu.Unlock()
+
+		for _, msg := range msgs {
+			//fmt.Printf("S%d,send apply msg in ProAPE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
+			rf.applyCh <- msg
+			// fmt.Printf("S%d,after sending apply msg in ProAPE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
+		}
+		rf.mu.Lock()
+		rf.lastApplied = max(rf.lastApplied, msgs[len(msgs)-1].CommandIndex)
+		rf.isApplyingLog = false
+		rf.mu.Unlock()
+		rf.applyCond.Broadcast()
+	}
+}
 func (rf *Raft) startElection(ch chan voteInfo) {
 	requestVoteArgs := &RequestVoteArgs{}
 	requestVoteArgs.Term = rf.currentTerm
@@ -939,7 +881,7 @@ func (rf *Raft) sendHeartBeat() {
 	}
 }
 
-func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
+func (rf *Raft) sendAPE() {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
@@ -974,204 +916,105 @@ func (rf *Raft) sendAPE(ch chan appendRelyInfo) {
 		} else {
 			args.LeaderCommitTerm = rf.log[rf.commitIndex-rf.logStartIndex].Term
 		}
-		go func(i int, ch chan appendRelyInfo) {
-			for rf.killed() == false {
-				reply := &AppendEntriesReply{}
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//fmt.Sprintf("leader %d send APE to %d\n", rf.me, peer),
-				//fmt.Sprintf("Am I leader %d, Am I dead %d, term %d", rf.Role, rf.dead, rf.currentTerm))
-				ok := rf.sendAppendEntries(peer, args, reply)
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//fmt.Sprintf("leader %d recive APERply from %d replyOk %v sucess %v\n", rf.me, peer, ok, reply.Success),
-				//fmt.Sprintf("Am I leader %d, Am I dead %d, term %d", rf.Role, rf.dead, rf.currentTerm))
-				startWaitReply := time.Now()
-				for !ok && rf.killed() == false {
-					// 3C中可能server是挂了，再重启，所以要持续发送
-					ok = rf.sendAppendEntries(peer, args, reply)
-					time.Sleep(10 * time.Millisecond)
-					if elapsed := time.Since(startWaitReply); elapsed > 300*time.Second {
-						// if the leader can Not get the reply from follower, it should not modify anything below
-						return
-					}
-				}
-				if rf.killed() {
+		go func(i int) {
+
+			reply := &AppendEntriesReply{}
+			//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+			//fmt.Sprintf("leader %d send APE to %d\n", rf.me, peer),
+			//fmt.Sprintf("Am I leader %d, Am I dead %d, term %d", rf.Role, rf.dead, rf.currentTerm))
+			if ok := rf.sendAppendEntries(peer, args, reply); !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Success {
+				lastApeIndex := args.PrevLogIndex + len(args.Entries)
+				if lastApeIndex > rf.logStartIndex+len(rf.log)-1 {
+					fmt.Println("this leader became follower and its log has been truncated")
+					rf.mu.Unlock()
 					return
 				}
 
-				if reply.Success {
-					ch <- appendRelyInfo{reply.Term, reply.Success, i, args.PrevLogIndex + len(args.Entries)}
-					break
-				} else {
-					rf.mu.Lock()
-					if reply.Term > args.Term {
-						// fmt.Println("term problem")
-						// should use args.Term, not rf.currentTerm, because when rpc reply back, currentTerm may change
-						// which leads the program to unexpect branch
-						// fmt.Println(args.Term, rf.currentTerm)
-						ch <- appendRelyInfo{reply.Term, reply.Success, i, -1}
-						rf.mu.Unlock()
-						break
-					} else {
-						// 处理不匹配的问题
-						// 重新给rpcArgs赋值，重新发送rpc
-						// fmt.Println("handling unMatch problem")
-						if reply.Xlen != -1 {
-							// XLen's problem
-							rf.nextIndex[peer] = reply.Xlen
-							// fmt.Printf("S%d handling unMatch len problem rf.nextIndex[%d]=%d,am I crash:%v %v\n", rf.me, peer, rf.nextIndex[peer], rf.killed(), time.Now().Format("15:04:05.000"))
-						} else {
-							left := 0
-							if rf.logStartIndex == 0 {
-								left = 1
-							} else {
-								left = rf.logStartIndex
-							}
-							right := rf.logStartIndex + len(rf.log) - 1
-							for left <= right {
-								mid := left + (right-left)/2
-								if rf.log[mid-rf.logStartIndex].Term > reply.Xterm {
-									right = mid - 1
-								} else {
-									left = mid + 1
-								}
-							}
-
-							lastLogTerm := rf.lastIncludedTerm
-							if left-1-rf.logStartIndex >= 0 {
-								lastLogTerm = rf.log[left-1-rf.logStartIndex].Term
-							}
-							if lastLogTerm != reply.Xterm {
-								// follower's conflict term not found in leader
-								rf.nextIndex[peer] = reply.Xindex
-							} else {
-								rf.nextIndex[peer] = left
-							}
-							// fmt.Printf("S%d handling unMatch Term problem rf.nextIndex[%d]=%d %v\n", rf.me, peer, rf.nextIndex[peer], time.Now().Format("15:04:05.000"))
-						}
-						args.PrevLogIndex = rf.nextIndex[peer] - 1
-						if args.PrevLogIndex >= len(rf.log)+rf.logStartIndex || args.PrevLogIndex < rf.logStartIndex {
-							rf.mu.Unlock()
-							return
-						}
-						args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.logStartIndex].Term
-						args.Entries = rf.log[rf.nextIndex[peer]-rf.logStartIndex:]
-						args.LeaderCommit = rf.commitIndex
-					}
-					rf.mu.Unlock()
-				}
-				time.Sleep(10 * time.Millisecond)
-			}
-		}(peer, ch)
-	}
-}
-
-func (rf *Raft) processAPE(ch chan appendRelyInfo) {
-	timeout := time.After(300 * time.Second)
-	for rf.killed() == false {
-		select {
-		case a := <-ch:
-			rf.mu.Lock()
-			if !a.success {
-				// become follower
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	"degraded to follower",
-				//	fmt.Sprintf("server %d is leader %v, term %d, but heartbeart reply term: %d", rf.me, rf.Role, rf.currentTerm, a.term))
-				if a.term > rf.currentTerm {
-					// fmt.Printf("S%d degradted to follower due recieve a new term %d to old term %d at %v\n", rf.Role, a.term, rf.currentTerm, time.Now().Format("15:04:05.000"))
-					//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-					//	"degraded to follower When processAPE",
-					//	fmt.Sprintf("My role is %d, my term is %d, but I reiecve term from : %d", rf.Role, rf.currentTerm, a.term))
-					rf.Role = follower
-					rf.currentTerm = a.term
-					rf.votedFor = -1
-					rf.persist(nil)
-
-					rf.resetElectionTimer()
-				}
-				rf.mu.Unlock()
-				break
-			} else {
-				// fmt.Printf("reply ape by %d last idx %d\n", a.peer, a.lastAPEIdx)
-				if a.lastAPEIdx > rf.logStartIndex+len(rf.log)-1 {
-					fmt.Println("this leader became follower and its log has been truncated")
-					rf.mu.Unlock()
-					break
-				}
-
-				if a.lastAPEIdx >= rf.matchIndex[a.peer] {
-					rf.nextIndex[a.peer] = a.lastAPEIdx + 1
-					rf.matchIndex[a.peer] = a.lastAPEIdx
+				if lastApeIndex >= rf.matchIndex[peer] {
+					rf.nextIndex[peer] = lastApeIndex + 1
+					rf.matchIndex[peer] = lastApeIndex
 					//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 					//	fmt.Sprintf("follower %d append last log %d logStart at: %d", a.peer, a.lastAPEIdx, rf.logStartIndex),
 					//	fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
 				} else {
 					// fmt.Println("ape done by follower but info is old")
 				}
-				// 可能存在a.lastAPEIdx < rf.logStartIndex的情况
-				// 因为这个回复lastAPEIdx，是之前已经commit掉的，可能已经snapshot后抛弃了，但这个follower还没来得及installsnapshot
-				// 这样的话下面的代码就直接跳过了，至少annotate会报错
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	fmt.Sprintf("Leader knew follower %d append last log %d com: %v", a.peer, a.lastAPEIdx, rf.log[a.lastAPEIdx-rf.logStartIndex].Command),
-				//	fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
-				if a.lastAPEIdx > rf.commitIndex {
+				if lastApeIndex > rf.commitIndex {
 					// 出现了一个新的可能已经在大部分follower得到复制的log
 					matchCnt := 1
 					for peer := range rf.matchIndex {
 						if peer == rf.me {
 							continue
 						}
-						if rf.matchIndex[peer] >= a.lastAPEIdx {
+						if rf.matchIndex[peer] >= lastApeIndex {
 							matchCnt++
 						}
 					}
-					if matchCnt > len(rf.peers)/2 && rf.log[a.lastAPEIdx-rf.logStartIndex].Term == rf.currentTerm {
-						preCommitIdx := rf.commitIndex
-						rf.commitIndex = a.lastAPEIdx
-						// fmt.Printf("could commit----S%d,%d\n", a.peer, rf.log[a.lastAPEIdx-rf.logStartIndex].Command)
-						var msgs []raftapi.ApplyMsg
-						for commitIdx := preCommitIdx + 1; commitIdx <= rf.commitIndex; commitIdx++ {
-							applyMsg := raftapi.ApplyMsg{}
-							applyMsg.CommandValid = true
-							applyMsg.Command = rf.log[commitIdx-rf.logStartIndex].Command
-							applyMsg.CommandIndex = commitIdx
-							// fmt.Printf("S%d inleader commit index: %d comm: %d %v\n", rf.me, commitIdx, applyMsg.Command, time.Now().Format("15:04:05"))
-							msgs = append(msgs, applyMsg)
-						}
-						rf.applyingLogCnt++
-						rf.mu.Unlock()
-
-						rf.applyCond.L.Lock()
-						for msgs[0].CommandIndex != rf.lastApplied+1 {
-							rf.applyCond.Wait()
-						}
-						rf.applyCond.L.Unlock()
-
-						for _, msg := range msgs {
-							//fmt.Printf("S%d,send apply msg in ProAPE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-							rf.applyCh <- msg
-							/*
-								rf.mu.Lock()
-								rf.lastApplied = msg.CommandIndex
-								rf.mu.Unlock()
-							*/
-							// fmt.Printf("S%d,after sending apply msg in ProAPE idx:%d, com: %d\n", rf.me, msg.CommandIndex, msg.Command)
-						}
-						rf.mu.Lock()
-						rf.lastApplied = msgs[len(msgs)-1].CommandIndex
-						rf.applyingLogCnt--
-						rf.mu.Unlock()
+					if matchCnt > len(rf.peers)/2 && rf.log[lastApeIndex-rf.logStartIndex].Term == rf.currentTerm {
+						rf.commitIndex = lastApeIndex
 						rf.applyCond.Broadcast()
-					} else {
-						rf.mu.Unlock()
+						// fmt.Printf("could commit----S%d,%d\n", a.peer, rf.log[a.lastAPEIdx-rf.logStartIndex].Command)
 					}
+				}
+			} else {
+				if reply.Term > args.Term {
+					// fmt.Println("term problem")
+					// should use args.Term, not rf.currentTerm, because when rpc reply back, currentTerm may change
+					// which leads the program to unexpect branch
+					// fmt.Println(args.Term, rf.currentTerm)
+					//	fmt.Sprintf("My role is %d, my term is %d, but I reiecve term from : %d", rf.Role, rf.currentTerm, a.term))
+					rf.Role = follower
+					rf.currentTerm = reply.Term
+					rf.votedFor = -1
+					rf.persist(nil)
+
+					rf.resetElectionTimer()
 				} else {
-					rf.mu.Unlock()
+					// 处理不匹配的问题
+					// 重新给rpcArgs赋值，重新发送rpc
+					// fmt.Println("handling unMatch problem")
+					if reply.Xlen != -1 {
+						// XLen's problem
+						rf.nextIndex[peer] = reply.Xlen
+						// fmt.Printf("S%d handling unMatch len problem rf.nextIndex[%d]=%d,am I crash:%v %v\n", rf.me, peer, rf.nextIndex[peer], rf.killed(), time.Now().Format("15:04:05.000"))
+					} else {
+						left := 0
+						if rf.logStartIndex == 0 {
+							left = 1
+						} else {
+							left = rf.logStartIndex
+						}
+						right := rf.logStartIndex + len(rf.log) - 1
+						for left <= right {
+							mid := left + (right-left)/2
+							if rf.log[mid-rf.logStartIndex].Term > reply.Xterm {
+								right = mid - 1
+							} else {
+								left = mid + 1
+							}
+						}
+
+						lastLogTerm := rf.lastIncludedTerm
+						if left-1-rf.logStartIndex >= 0 {
+							lastLogTerm = rf.log[left-1-rf.logStartIndex].Term
+						}
+						if lastLogTerm != reply.Xterm {
+							// follower's conflict term not found in leader
+							rf.nextIndex[peer] = reply.Xindex
+						} else {
+							rf.nextIndex[peer] = left
+						}
+						// fmt.Printf("S%d handling unMatch Term problem rf.nextIndex[%d]=%d %v\n", rf.me, peer, rf.nextIndex[peer], time.Now().Format("15:04:05.000"))
+					}
 				}
 			}
-		case <-timeout:
-			close(ch)
-			break
-		}
+		}(peer)
 	}
 }
 
@@ -1208,6 +1051,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	go rf.applyTicker()
 
 	return rf
 }
