@@ -1,25 +1,41 @@
 package rsm
 
 import (
+	"math/rand"
 	"sync"
+	"time"
 
 	"6.5840/kvsrv1/rpc"
 	"6.5840/labrpc"
 	"6.5840/raft1"
 	"6.5840/raftapi"
 	"6.5840/tester1"
-
 )
 
 var useRaftStateMachine bool // to plug in another raft besided raft1
-
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Me  int
+	Id  int64
+	Req any
 }
 
+type PendingOp struct {
+	id   int64
+	term int
+	ch   chan any
+}
+
+func (pendingOp *PendingOp) notify(res any) {
+	// Best practice for avoiding blocking
+	select {
+	case pendingOp.ch <- res:
+	default:
+	}
+}
 
 // A server (i.e., ../server.go) that wants to replicate itself calls
 // MakeRSM and must implement the StateMachine interface.  This
@@ -41,6 +57,9 @@ type RSM struct {
 	maxraftstate int // snapshot if log grows this big
 	sm           StateMachine
 	// Your definitions here.
+	pendingOps map[int]*PendingOp //logIdx : opId
+
+	shutdownCh chan struct{}
 }
 
 // servers[] contains the ports of the set of
@@ -64,17 +83,19 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 		maxraftstate: maxraftstate,
 		applyCh:      make(chan raftapi.ApplyMsg),
 		sm:           sm,
+		pendingOps:   make(map[int]*PendingOp),
+		shutdownCh:   make(chan struct{}),
 	}
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	go rsm.reader()
 	return rsm
 }
 
 func (rsm *RSM) Raft() raftapi.Raft {
 	return rsm.rf
 }
-
 
 // Submit a command to Raft, and wait for it to be committed.  It
 // should return ErrWrongLeader if client should find new leader and
@@ -84,7 +105,88 @@ func (rsm *RSM) Submit(req any) (rpc.Err, any) {
 	// Submit creates an Op structure to run a command through Raft;
 	// for example: op := Op{Me: rsm.me, Id: id, Req: req}, where req
 	// is the argument to Submit and id is a unique id for the op.
+	op := Op{Me: rsm.me, Id: rand.Int63(), Req: req}
+	rsm.mu.Lock()
+	idx, term, isleader := rsm.rf.Start(op)
+	if !isleader {
+		rsm.mu.Unlock()
+		return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+	}
+	pendingOp := &PendingOp{id: op.Id, term: term, ch: make(chan any, 1)}
+	rsm.addOp(idx, pendingOp)
+	rsm.mu.Unlock()
+	return rsm.waitOp(idx, pendingOp)
+}
 
-	// your code here
-	return rpc.ErrWrongLeader, nil // i'm dead, try another server.
+func (rsm *RSM) waitOp(idx int, pendingOp *PendingOp) (rpc.Err, any) {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	defer rsm.removeOp(idx, pendingOp)
+
+	for {
+		select {
+		case reply := <-pendingOp.ch:
+			if reply == struct{}{} { // this op should be aborted
+				return rpc.ErrWrongLeader, nil
+			}
+			return rpc.OK, reply
+		case <-ticker.C:
+			term, isleader := rsm.rf.GetState()
+			if !isleader || term != pendingOp.term {
+				return rpc.ErrWrongLeader, nil
+			}
+		// when rf is killed, next submit will return quickly
+		case <-rsm.shutdownCh:
+			return rpc.ErrWrongLeader, nil
+		}
+	}
+}
+
+func (rsm *RSM) addOp(idx int, pendingOp *PendingOp) {
+	if oldPendingOp, ok := rsm.pendingOps[idx]; ok {
+		oldPendingOp.notify(struct{}{})
+	}
+	rsm.pendingOps[idx] = pendingOp
+}
+
+func (rsm *RSM) removeOp(idx int, pendingOp *PendingOp) {
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+	if curPendingOp, ok := rsm.pendingOps[idx]; ok && curPendingOp == pendingOp {
+		delete(rsm.pendingOps, idx)
+	}
+}
+
+func (rsm *RSM) reader() {
+	for msg := range rsm.applyCh {
+		if msg.CommandValid {
+			op, ok := msg.Command.(Op)
+			if !ok || op.Req == nil {
+				return
+			}
+			res := rsm.sm.DoOp(op.Req)
+
+			// Below are actually what should do only for leader or old leader
+			rsm.mu.Lock()
+			if pendingOp, ok := rsm.pendingOps[msg.CommandIndex]; ok {
+				if pendingOp.id == op.Id {
+					pendingOp.notify(res)
+				} else {
+					// old leader's pendingOp overwrite
+					pendingOp.notify(struct{}{})
+				}
+			}
+			rsm.mu.Unlock()
+		} else { // snapShot apply
+
+		}
+	}
+
+	rsm.mu.Lock()
+	defer rsm.mu.Unlock()
+	for _, pendingOp := range rsm.pendingOps {
+		pendingOp.notify(struct{}{})
+	}
+	clear(rsm.pendingOps)
+	close(rsm.shutdownCh)
 }

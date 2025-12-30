@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"sync"
 	"sync/atomic"
 
 	"6.5840/kvraft1/rsm"
@@ -8,15 +9,19 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/tester1"
-
 )
+
+type tuple struct {
+	value   string
+	version rpc.Tversion
+}
 
 type KVServer struct {
 	me   int
 	dead int32 // set by Kill()
 	rsm  *rsm.RSM
-
-	// Your definitions here.
+	mu   sync.Mutex
+	data map[string]tuple
 }
 
 // To type-cast req to the right type, take a look at Go's type switches or type
@@ -26,6 +31,40 @@ type KVServer struct {
 // https://go.dev/tour/methods/15
 func (kv *KVServer) DoOp(req any) any {
 	// Your code here
+	switch req := req.(type) {
+	case *rpc.GetArgs:
+		var reply rpc.GetReply
+		kv.mu.Lock()
+		if t, ok := kv.data[req.Key]; !ok {
+			reply.Err = rpc.ErrNoKey
+		} else {
+			reply.Value = t.value
+			reply.Version = t.version
+			reply.Err = rpc.OK
+		}
+		kv.mu.Unlock()
+		return reply
+	case *rpc.PutArgs:
+		var reply rpc.PutReply
+		kv.mu.Lock()
+		if t, ok := kv.data[req.Key]; !ok {
+			if req.Version == 0 {
+				kv.data[req.Key] = tuple{req.Value, req.Version + 1}
+				reply.Err = rpc.OK
+			} else {
+				reply.Err = rpc.ErrNoKey
+			}
+		} else {
+			if req.Version != t.version {
+				reply.Err = rpc.ErrVersion
+			} else {
+				kv.data[req.Key] = tuple{req.Value, req.Version + 1}
+				reply.Err = rpc.OK
+			}
+		}
+		kv.mu.Unlock()
+		return reply
+	}
 	return nil
 }
 
@@ -42,12 +81,24 @@ func (kv *KVServer) Get(args *rpc.GetArgs, reply *rpc.GetReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a GetReply: rep.(rpc.GetReply)
+	err, rep := kv.rsm.Submit(args)
+	if err == rpc.OK {
+		*reply = rep.(rpc.GetReply)
+	} else {
+		reply.Err = err
+	}
 }
 
 func (kv *KVServer) Put(args *rpc.PutArgs, reply *rpc.PutReply) {
 	// Your code here. Use kv.rsm.Submit() to submit args
 	// You can use go's type casts to turn the any return value
 	// of Submit() into a PutReply: rep.(rpc.PutReply)
+	err, rep := kv.rsm.Submit(args)
+	if err == rpc.OK {
+		*reply = rep.(rpc.PutReply)
+	} else {
+		reply.Err = err
+	}
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -74,13 +125,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, gid tester.Tgid, me int, persist
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(rsm.Op{})
-	labgob.Register(rpc.PutArgs{})
-	labgob.Register(rpc.GetArgs{})
+	// Must Register pointer type here, not value type!!!
+	// Otherwise, rpc between raft peers will Not serialize/deserialize it correctly
+	// command in Raft's log is an interface, its type must be determined at runtime
+	labgob.Register(&rpc.PutArgs{})
+	labgob.Register(&rpc.GetArgs{})
 
 	kv := &KVServer{me: me}
 
-
 	kv.rsm = rsm.MakeRSM(servers, me, persister, maxraftstate, kv)
 	// You may need initialization code here.
+	kv.data = make(map[string]tuple)
 	return []tester.IService{kv, kv.rsm.Raft()}
 }

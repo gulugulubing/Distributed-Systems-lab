@@ -71,8 +71,12 @@ type Raft struct {
 	lastIncludedTerm int
 
 	// for serialize apply
-	applyCond     *sync.Cond
-	isApplyingLog bool // tell installed snapshot apply wait
+	applyCond *sync.Cond
+
+	// for pending snapshot
+	pendingSnapshot      []byte
+	pendingSnapshotIndex int
+	pendingSnapshotTerm  int
 }
 
 // 在初始化每个 Raft 节点时调用
@@ -279,9 +283,9 @@ func (rf *Raft) sendInstallSnapshot(peer int) {
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
-		rf.mu.Unlock()
 		return
 	}
 
@@ -300,19 +304,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	if args.LastIncludedIndex <= rf.lastApplied || args.LastIncludedIndex+1 < rf.logStartIndex {
 		// 不需要你的snapshot，我自己就行
-		rf.mu.Unlock()
-		return
-	}
-
-	for rf.isApplyingLog {
-		// fmt.Printf("S%d waiting install snap lastIncludedIndex: %d %v\n", rf.me, args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
-		//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-		//"waiting install snapshot",
-		//fmt.Sprintf("lastIncludedIndex: %d, lastIncludedTerm: %d", args.LastIncludedIndex, args.LastIncludedTerm))
-		rf.applyCond.Wait()
-	}
-	if args.LastIncludedIndex <= rf.lastApplied || args.LastIncludedIndex+1 < rf.logStartIndex {
-		rf.mu.Unlock()
 		return
 	}
 
@@ -324,7 +315,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// oldLogLen := len(rf.log)
 		// rf.log = rf.log[args.LastIncludedIndex+1-rf.logStartIndex:]
 		// fmt.Printf("S%d Installing snapshot truncate previous log (oldStartIndex: %d, : newStartIndex%d),(oldLogLen %d : new LogLe %d) %v\n", rf.me, rf.logStartIndex, args.LastIncludedIndex+1, oldLogLen, len(rf.log), time.Now().Format("15:04:05.000"))
-		rf.mu.Unlock()
 		return
 	}
 
@@ -335,28 +325,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.commitIndex = args.LastIncludedIndex
 		rf.lastApplied = args.LastIncludedIndex
 	} else {
-		rf.mu.Unlock()
 		return
 	}
-	rf.isApplyingLog = true
-	rf.applyCond.L.Unlock()
 
-	msg := raftapi.ApplyMsg{}
-	msg.CommandValid = false
-	msg.SnapshotValid = true
-	msg.Snapshot = args.Data
-	msg.SnapshotTerm = args.LastIncludedTerm
-	msg.SnapshotIndex = args.LastIncludedIndex
-	rf.applyCh <- msg
-
-	rf.mu.Lock()
-	rf.isApplyingLog = false
-	rf.mu.Unlock()
-	rf.applyCond.Broadcast()
-	// fmt.Printf("S%d finish install snap lastIncludedIndex: %d %v", rf.me, args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
-	//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-	//	"finish install snapshot",
-	//	fmt.Sprintf("lastIncludedIndex: %d, lastIncludedTerm: %d", args.LastIncludedIndex, args.LastIncludedTerm))
+	rf.pendingSnapshot = args.Data
+	rf.pendingSnapshotIndex = args.LastIncludedIndex
+	rf.pendingSnapshotTerm = args.LastIncludedTerm
 }
 
 // example RequestVote RPC arguments structure.
@@ -674,6 +648,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	// notify applier to close applyCh and return
+	rf.applyCond.Broadcast()
+
 }
 
 func (rf *Raft) killed() bool {
@@ -731,14 +708,29 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) applyTicker() {
+	defer close(rf.applyCh)
 	for rf.killed() == false {
 		rf.mu.Lock()
-		for (rf.lastApplied >= rf.commitIndex || rf.isApplyingLog) && !rf.killed() {
+		for rf.lastApplied >= rf.commitIndex && rf.pendingSnapshot == nil && !rf.killed() {
 			rf.applyCond.Wait()
 		}
 		if rf.killed() {
 			rf.mu.Unlock()
 			return
+		}
+
+		if rf.pendingSnapshot != nil {
+			snapshot := rf.pendingSnapshot
+			rf.pendingSnapshot = nil
+			rf.mu.Unlock()
+
+			rf.applyCh <- raftapi.ApplyMsg{
+				SnapshotValid: true,
+				Snapshot:      snapshot,
+				SnapshotTerm:  rf.pendingSnapshotTerm,
+				SnapshotIndex: rf.pendingSnapshotIndex,
+			}
+			continue
 		}
 
 		var msgs []raftapi.ApplyMsg
@@ -750,7 +742,6 @@ func (rf *Raft) applyTicker() {
 			// fmt.Printf("S%d commit index: %d comm: %d %v\n", rf.me, commitIdx, applyMsg.Command, time.Now().Format("15:04:05"))
 			msgs = append(msgs, applyMsg)
 		}
-		rf.isApplyingLog = true
 		rf.mu.Unlock()
 
 		for _, msg := range msgs {
@@ -760,7 +751,6 @@ func (rf *Raft) applyTicker() {
 		}
 		rf.mu.Lock()
 		rf.lastApplied = max(rf.lastApplied, msgs[len(msgs)-1].CommandIndex)
-		rf.isApplyingLog = false
 		rf.mu.Unlock()
 		rf.applyCond.Broadcast()
 	}
@@ -959,7 +949,6 @@ func (rf *Raft) sendAPE() {
 					if matchCnt > len(rf.peers)/2 && rf.log[lastApeIndex-rf.logStartIndex].Term == rf.currentTerm {
 						rf.commitIndex = lastApeIndex
 						rf.applyCond.Broadcast()
-						// fmt.Printf("could commit----S%d,%d\n", a.peer, rf.log[a.lastAPEIdx-rf.logStartIndex].Command)
 					}
 				}
 			} else {
