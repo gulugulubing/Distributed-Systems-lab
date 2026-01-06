@@ -89,6 +89,10 @@ func MakeRSM(servers []*labrpc.ClientEnd, me int, persister *tester.Persister, m
 	if !useRaftStateMachine {
 		rsm.rf = raft.Make(servers, me, persister, rsm.applyCh)
 	}
+	snapshot := persister.ReadSnapshot()
+	if len(snapshot) > 0 && maxraftstate >= 0 {
+		sm.Restore(snapshot)
+	}
 	go rsm.reader()
 	return rsm
 }
@@ -176,9 +180,22 @@ func (rsm *RSM) reader() {
 					pendingOp.notify(struct{}{})
 				}
 			}
+
+			if rsm.maxraftstate >= 0 && rsm.rf.PersistBytes() > rsm.maxraftstate {
+				index := msg.CommandIndex
+				snapshot := rsm.sm.Snapshot()
+				// must launch a goroutine?
+				go rsm.rf.Snapshot(index, snapshot)
+			}
 			rsm.mu.Unlock()
 		} else { // snapShot apply
-
+			rsm.sm.Restore(msg.Snapshot)
+			rsm.mu.Lock()
+			for _, pendingOp := range rsm.pendingOps {
+				pendingOp.notify(struct{}{})
+			}
+			clear(rsm.pendingOps)
+			rsm.mu.Unlock()
 		}
 	}
 

@@ -66,8 +66,7 @@ type Raft struct {
 	matchIndex []int
 
 	// for snapshot, need persistence
-	logStartIndex int
-
+	logStartIndex    int
 	lastIncludedTerm int
 
 	// for serialize apply
@@ -79,15 +78,11 @@ type Raft struct {
 	pendingSnapshotTerm  int
 }
 
-// 在初始化每个 Raft 节点时调用
 func (rf *Raft) initRand() {
-	// 使用当前时间的纳秒级时间戳 + 节点ID作为种子
-	// 这样可以确保不同节点、不同启动时刻的种子都不同
 	seed := time.Now().UnixNano() + int64(rf.me)
 	rf.rdSeed = rand.New(rand.NewSource(seed))
 }
 
-// 然后在需要生成随机超时的地方使用这个实例
 func (rf *Raft) resetElectionTimer() {
 	randomRange := 600 // 600ms 的随机范围
 	baseTimeout := 500 // 基础超时 500ms
@@ -134,7 +129,10 @@ func (rf *Raft) persist(snapshot []byte) {
 		fmt.Println("encoding fails")
 	}
 	if err := e.Encode(rf.logStartIndex); err != nil {
-		fmt.Println("encoding fails")
+		panic("raft encoding fails")
+	}
+	if err := e.Encode(rf.lastIncludedTerm); err != nil {
+		panic("raft encoding lastIncludedTerm fails")
 	}
 	raftstate := w.Bytes()
 	if snapshot == nil {
@@ -155,13 +153,15 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var logStartIndex int
-	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&logStartIndex) != nil {
-		fmt.Println("readPersist fails")
+	var lastIncludedTerm int
+	if d.Decode(&currentTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil || d.Decode(&logStartIndex) != nil || d.Decode(&lastIncludedTerm) != nil {
+		panic("raft readPersist fails")
 	} else {
 		rf.votedFor = votedFor
 		rf.currentTerm = currentTerm
 		rf.log = log
 		rf.logStartIndex = logStartIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 		if rf.logStartIndex > 0 {
 			rf.lastApplied = logStartIndex - 1
 			rf.commitIndex = logStartIndex - 1
@@ -215,13 +215,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.logStartIndex = index + 1
 		rf.persist(snapshot)
 
-		//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-		//	"doing snapshot",
-		//	fmt.Sprintf("new logStartIndex %d %v", index+1, time.Now().Format("15:04:05")))
-		// fmt.Printf("S%d doing snapshot new logStartIndex %d %v\n", rf.me, index+1, time.Now().Format("15:04:05.000"))
-		//if rf.Role == leader {
-		//	rf.sendInstallSnapshot()
-		//}
 	}
 }
 
@@ -242,18 +235,7 @@ func (rf *Raft) sendInstallSnapshot(peer int) {
 	}
 	// fmt.Printf("S%d try send snapshot to nextIndex[%d]=%d lastIncludeIndex %d %v\n", rf.me, peer, rf.nextIndex[peer], args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
 	rf.mu.Unlock()
-	// startWaitReply := time.Now()
 	ok := rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
-	/*
-		for !ok && !rf.killed() {
-			ok = rf.peers[peer].Call("Raft.InstallSnapshot", &args, &reply)
-			time.Sleep(10 * time.Millisecond)
-			if elapsed := time.Since(startWaitReply); elapsed > 300*time.Second {
-				// if the leader can Not get the reply from follower, it should not modify anything below
-				return
-			}
-		}
-	*/
 
 	if !ok {
 		return
@@ -272,10 +254,6 @@ func (rf *Raft) sendInstallSnapshot(peer int) {
 	if args.LastIncludedIndex > rf.matchIndex[peer] {
 		rf.nextIndex[peer] = args.LastIncludedIndex + 1
 		rf.matchIndex[peer] = args.LastIncludedIndex
-		// fmt.Printf("slow s%d catch match index %d\n", peer, rf.nextIndex[peer])
-		// tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-		//"catch match index",
-		//fmt.Sprintf("slow s%d catch match index %d %v", peer, rf.nextIndex[peer], time.Now().Format("15:04:05.000")))
 	} else {
 		// fmt.Printf("old installSnapshot reply. Now %d's next is %d while args'lastIncludeIndex is %d %v\n", peer, rf.nextIndex[peer], args.LastIncludedIndex, time.Now().Format("15:04:05.000"))
 	}
@@ -302,20 +280,19 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.persist(nil)
 	}
 
-	if args.LastIncludedIndex <= rf.lastApplied || args.LastIncludedIndex+1 < rf.logStartIndex {
-		// 不需要你的snapshot，我自己就行
+	if args.LastIncludedIndex <= rf.lastApplied || args.LastIncludedIndex < rf.logStartIndex {
+		// no need to send reply
 		return
 	}
 
 	if args.LastIncludedIndex >= rf.logStartIndex+len(rf.log)-1 {
-		// oldLogLen := len(rf.log)
 		rf.log = make([]LogEntry, 0)
-		// fmt.Printf("S%d Installing snapshot remove all previous (oldStartIndex: %d, : newStartIndex%d),(oldLogLen %d : new LogLe %d) %v\n", rf.me, rf.logStartIndex, args.LastIncludedIndex+1, oldLogLen, len(rf.log), time.Now().Format("15:04:05.000"))
 	} else {
-		// oldLogLen := len(rf.log)
-		// rf.log = rf.log[args.LastIncludedIndex+1-rf.logStartIndex:]
-		// fmt.Printf("S%d Installing snapshot truncate previous log (oldStartIndex: %d, : newStartIndex%d),(oldLogLen %d : new LogLe %d) %v\n", rf.me, rf.logStartIndex, args.LastIncludedIndex+1, oldLogLen, len(rf.log), time.Now().Format("15:04:05.000"))
-		return
+		if args.LastIncludedTerm == rf.log[args.LastIncludedIndex-rf.logStartIndex].Term {
+			rf.log = rf.log[args.LastIncludedIndex+1-rf.logStartIndex:]
+		} else {
+			rf.log = make([]LogEntry, 0)
+		}
 	}
 
 	rf.logStartIndex = args.LastIncludedIndex + 1
@@ -323,14 +300,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.persist(args.Data)
 	if rf.commitIndex < args.LastIncludedIndex {
 		rf.commitIndex = args.LastIncludedIndex
-		rf.lastApplied = args.LastIncludedIndex
-	} else {
-		return
 	}
 
 	rf.pendingSnapshot = args.Data
 	rf.pendingSnapshotIndex = args.LastIncludedIndex
 	rf.pendingSnapshotTerm = args.LastIncludedTerm
+	rf.applyCond.Broadcast()
 }
 
 // example RequestVote RPC arguments structure.
@@ -488,10 +463,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if args.Term > rf.currentTerm { // discover a new term
 			if rf.Role != follower {
 				rf.Role = follower
-				// fmt.Printf("S%d degradted to follower due recieve a new term %d to old term %d at %v\n", rf.Role, args.Term, rf.currentTerm, time.Now().Format("15:04:05.000"))
-				// tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	"degraded to follower",
-				//	fmt.Sprintf("reiecve HB with new term: %d", args.Term))
 			}
 			rf.votedFor = -1
 			rf.currentTerm = args.Term
@@ -500,7 +471,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 		rf.resetElectionTimer()
 
-		// heartbeat时看到新的,因为heartbeat这里preLog检验匹配，所以这里就检验args.leaderCommit了
 		if args.LeaderCommit < rf.logStartIndex+len(rf.log) && args.LeaderCommit-rf.logStartIndex >= 0 && args.LeaderCommitTerm == rf.log[args.LeaderCommit-rf.logStartIndex].Term {
 			if args.LeaderCommit > rf.commitIndex {
 				rf.commitIndex = args.LeaderCommit
@@ -540,7 +510,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			return
 		}
 
-		// 如果小于的话，一定是吻合的，logStartIndex前面都是commit的
+		// idx < logStartIndex are all commited
 		if args.PrevLogIndex >= rf.logStartIndex && rf.log[args.PrevLogIndex-rf.logStartIndex].Term != args.PrevLogTerm {
 			// fmt.Printf("APE find S%d pre Log term unmatch%v\n", rf.me, time.Now().Format("15:04:05"))
 			reply.Xlen = -1 // indicate not the above problem
@@ -587,7 +557,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			}
 		}
 		rf.persist(nil)
-		// fmt.Printf("S%d rev APE PrevlogIdx %d apeLogLen %d lastComm %d %v at logStartIdx %d, now len:%d\n", rf.me, args.PrevLogIndex, len(args.Entries), args.Entries[len(args.Entries)-1].Command, time.Now().Format("15:04:05.000"), rf.logStartIndex, len(rf.log))
+		//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+		//	"receive new APE log ",
+		//	fmt.Sprintf("S%d recieve a new log at term %d   PrevlogIdx %d apeLogLen %d lastComm %d at %v\n", rf.me, args.Term, args.PrevLogIndex, len(args.Entries), args.Entries[len(args.Entries)-1].Command, time.Now().Format("15:04:05.000")))
+		// fmt.Printf("S%d rev APE PrevlogIdx %d apeLogLen %d lastComm %d %v at logStartIdx %d, now len:%d, argTerm: %d, myTerm %d\n", rf.me, args.PrevLogIndex, len(args.Entries), args.Entries[len(args.Entries)-1].Command, time.Now().Format("15:04:05.000"), rf.logStartIndex, len(rf.log), args.Term, rf.currentTerm)
 		reply.Success = true
 		if args.LeaderCommit > rf.commitIndex {
 			rf.commitIndex = min(rf.logStartIndex+len(rf.log)-1, args.LeaderCommit)
@@ -629,10 +602,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index = len(rf.log) + rf.logStartIndex
 	term = rf.currentTerm
 	isLeader = true
-	// fmt.Printf("S%d start idx%d command %d %v\n", rf.me, len(rf.log)+rf.logStartIndex, command, time.Now().Format("15:04:05.000"))
+	// fmt.Printf("S%d start idx%d command %d at Term %d, %v\n", rf.me, len(rf.log)+rf.logStartIndex, command, rf.currentTerm, time.Now().Format("15:04:05.000"))
 	rf.log = append(rf.log, LogEntry{rf.currentTerm, command})
 	rf.persist(nil)
-
+	rf.sendAPE()
 	return index, term, isLeader
 }
 
@@ -675,16 +648,15 @@ func (rf *Raft) ticker() {
 
 				ch := make(chan voteInfo, len(rf.peers)-1)
 				// fmt.Printf("S%d become candid at term %d %v\n", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000"))
-				// tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//fmt.Sprintf("candi‘s term: %d", rf.currentTerm),
-				//fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
+				/*tester.Annotate(fmt.Sprintf("Server %d", rf.me),
+				fmt.Sprintf("candi‘s term: %d", rf.currentTerm),
+				fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
+				*/
 				rf.startElection(ch)
 				go rf.processElectionResult(ch)
 			}
 		} else {
 			if elapsed := time.Since(rf.lastHeartbeatTime); elapsed > 100*time.Millisecond {
-				// lab的hint里说测试会要求heartbeat是100ms，但我没想明白为什么测试可以控制hb，不得是我的代码里控制的么
-				rf.sendHeartBeat()
 				rf.lastHeartbeatTime = time.Now()
 				rf.sendAPE()
 
@@ -722,14 +694,19 @@ func (rf *Raft) applyTicker() {
 		if rf.pendingSnapshot != nil {
 			snapshot := rf.pendingSnapshot
 			rf.pendingSnapshot = nil
+			pendingSnapshotTerm := rf.pendingSnapshotTerm
+			pendingSnapshotIndex := rf.pendingSnapshotIndex
 			rf.mu.Unlock()
 
 			rf.applyCh <- raftapi.ApplyMsg{
 				SnapshotValid: true,
 				Snapshot:      snapshot,
-				SnapshotTerm:  rf.pendingSnapshotTerm,
-				SnapshotIndex: rf.pendingSnapshotIndex,
+				SnapshotTerm:  pendingSnapshotTerm,
+				SnapshotIndex: pendingSnapshotIndex,
 			}
+			rf.mu.Lock()
+			rf.lastApplied = max(rf.lastApplied, pendingSnapshotIndex)
+			rf.mu.Unlock()
 			continue
 		}
 
@@ -752,7 +729,6 @@ func (rf *Raft) applyTicker() {
 		rf.mu.Lock()
 		rf.lastApplied = max(rf.lastApplied, msgs[len(msgs)-1].CommandIndex)
 		rf.mu.Unlock()
-		rf.applyCond.Broadcast()
 	}
 }
 func (rf *Raft) startElection(ch chan voteInfo) {
@@ -810,12 +786,11 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 				if v.voteGranted {
 					// fmt.Printf("Election for me %v\n", rf.me)
 					voteCount++
-					if voteCount > len(rf.peers)/2 && v.term == rf.currentTerm {
+					if voteCount > len(rf.peers)/2 && v.term == rf.currentTerm && rf.Role != leader {
 						// maybe old term vote come, so need to check term here
 						rf.Role = leader
 						rf.nextIndex = make([]int, len(rf.peers))
 						rf.matchIndex = make([]int, len(rf.peers))
-						rf.sendHeartBeat()
 						// fmt.Printf("S%d win leader at term %d %v\n", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000"))
 						// tester.Annotate(fmt.Sprintf("Server %d", rf.me), "I win Leader", fmt.Sprintf("Server %d term %d at %v", rf.me, rf.currentTerm, time.Now().Format("15:04:05.000")))
 						for i := 0; i < len(rf.peers); i++ {
@@ -824,6 +799,7 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 								rf.matchIndex[i] = 0
 							}
 						}
+						rf.sendAPE()
 					}
 				}
 			}
@@ -836,83 +812,54 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 	}
 }
 
-func (rf *Raft) sendHeartBeat() {
-	args := &AppendEntriesArgs{}
-	args.Term = rf.currentTerm
-	args.LeaderId = rf.me
-	args.Entries = nil // default is nil, just explicitly
-	args.LeaderCommit = rf.commitIndex
-	if rf.commitIndex-rf.logStartIndex >= 0 && rf.commitIndex-rf.logStartIndex < len(rf.log) {
-		args.LeaderCommitTerm = rf.log[rf.commitIndex-rf.logStartIndex].Term
-	}
-
-	for peer := range rf.peers {
-		if peer == rf.me {
-			continue
-		}
-		if rf.logStartIndex+len(rf.log)-1 >= rf.nextIndex[peer] {
-			// will send an APE soon, no need to heartbeat
-			continue
-		}
-		go func(i int) {
-			reply := &AppendEntriesReply{}
-			if ok := rf.sendAppendEntries(i, args, reply); ok {
-				rf.mu.Lock()
-				if !reply.Success && reply.Term > rf.currentTerm {
-					rf.currentTerm = reply.Term
-					rf.Role = follower
-					rf.votedFor = -1
-					rf.persist(nil)
-					rf.resetElectionTimer()
-				}
-				rf.mu.Unlock()
-			}
-		}(peer)
-	}
-}
-
 func (rf *Raft) sendAPE() {
 	for peer := range rf.peers {
 		if peer == rf.me {
 			continue
 		}
-		if rf.logStartIndex+len(rf.log)-1 < rf.nextIndex[peer] {
-			// last index < nextIndex, no need to send ape
-			continue
-		}
-		args := &AppendEntriesArgs{}
-		args.Term = rf.currentTerm
-		args.LeaderId = rf.me
-		args.PrevLogIndex = rf.nextIndex[peer] - 1
-		if args.PrevLogIndex < rf.logStartIndex-1 {
-			// follower太落后了，应该给他InstallSnapshot
-			// fmt.Printf("S%d too slow,preLogIdx%d : logStartIdx %d %v\n", peer, args.PrevLogIndex, rf.logStartIndex, time.Now().Format("15:04:05.000"))
-			continue
-		}
-		if args.PrevLogIndex == rf.logStartIndex-1 {
-			args.PrevLogTerm = rf.lastIncludedTerm
-		} else {
-			args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.logStartIndex].Term
-		}
-		if rf.logStartIndex+len(rf.log) > rf.nextIndex[peer] {
-			entriesToCopy := rf.log[rf.nextIndex[peer]-rf.logStartIndex:]
-			args.Entries = make([]LogEntry, len(entriesToCopy))
-			copy(args.Entries, entriesToCopy) // 关键：复制数据到新切片
-		}
-		// fmt.Printf("S%d send %d\n", rf.me, args.Entries[len(args.Entries)-1].Command)
-		args.LeaderCommit = rf.commitIndex
-		if rf.commitIndex-rf.logStartIndex < 0 {
-			args.LeaderCommitTerm = rf.lastIncludedTerm
-		} else {
-			args.LeaderCommitTerm = rf.log[rf.commitIndex-rf.logStartIndex].Term
-		}
-		go func(i int) {
+
+		go func(p int) {
+			args := &AppendEntriesArgs{}
+			rf.mu.Lock()
+			if rf.Role != leader {
+				rf.mu.Unlock()
+				return
+			}
+			if rf.nextIndex[p] < rf.logStartIndex {
+				// should send snap not APE
+				// fmt.Printf("S%d too slow,preLogIdx%d : logStartIdx %d %v\n", peer, args.PrevLogIndex, rf.logStartIndex, time.Now().Format("15:04:05.000"))
+				rf.mu.Unlock()
+				return
+			}
+			args.Term = rf.currentTerm
+			args.LeaderId = rf.me
+			args.PrevLogIndex = rf.nextIndex[p] - 1
+			if args.PrevLogIndex == rf.logStartIndex-1 {
+				args.PrevLogTerm = rf.lastIncludedTerm
+			} else {
+				args.PrevLogTerm = rf.log[args.PrevLogIndex-rf.logStartIndex].Term
+			}
+			if rf.logStartIndex+len(rf.log) > rf.nextIndex[p] {
+				entriesToCopy := rf.log[rf.nextIndex[p]-rf.logStartIndex:]
+				args.Entries = make([]LogEntry, len(entriesToCopy))
+				copy(args.Entries, entriesToCopy) // 关键：复制数据到新切片
+				//fmt.Printf("S%d send APE %d at Term %d\n", rf.me, args.Entries[len(args.Entries)-1].Command, rf.currentTerm)
+			} else {
+				args.Entries = nil
+			}
+			args.LeaderCommit = rf.commitIndex
+			if rf.commitIndex-rf.logStartIndex < 0 {
+				args.LeaderCommitTerm = rf.lastIncludedTerm
+			} else {
+				args.LeaderCommitTerm = rf.log[rf.commitIndex-rf.logStartIndex].Term
+			}
+			rf.mu.Unlock()
 
 			reply := &AppendEntriesReply{}
 			//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 			//fmt.Sprintf("leader %d send APE to %d\n", rf.me, peer),
 			//fmt.Sprintf("Am I leader %d, Am I dead %d, term %d", rf.Role, rf.dead, rf.currentTerm))
-			if ok := rf.sendAppendEntries(peer, args, reply); !ok {
+			if ok := rf.sendAppendEntries(p, args, reply); !ok {
 				return
 			}
 
@@ -921,14 +868,13 @@ func (rf *Raft) sendAPE() {
 			if reply.Success {
 				lastApeIndex := args.PrevLogIndex + len(args.Entries)
 				if lastApeIndex > rf.logStartIndex+len(rf.log)-1 {
-					fmt.Println("this leader became follower and its log has been truncated")
-					rf.mu.Unlock()
+					// fmt.Println("this leader became follower and its log has been truncated")
 					return
 				}
 
-				if lastApeIndex >= rf.matchIndex[peer] {
-					rf.nextIndex[peer] = lastApeIndex + 1
-					rf.matchIndex[peer] = lastApeIndex
+				if lastApeIndex >= rf.matchIndex[p] {
+					rf.nextIndex[p] = lastApeIndex + 1
+					rf.matchIndex[p] = lastApeIndex
 					//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
 					//	fmt.Sprintf("follower %d append last log %d logStart at: %d", a.peer, a.lastAPEIdx, rf.logStartIndex),
 					//	fmt.Sprintf("Server %d at %v", rf.me, time.Now().Format("15:04:05.000")))
@@ -936,41 +882,40 @@ func (rf *Raft) sendAPE() {
 					// fmt.Println("ape done by follower but info is old")
 				}
 				if lastApeIndex > rf.commitIndex {
-					// 出现了一个新的可能已经在大部分follower得到复制的log
+					// a potential commit log copied by the majority
 					matchCnt := 1
-					for peer := range rf.matchIndex {
-						if peer == rf.me {
+					for peerId := range rf.matchIndex {
+						if peerId == rf.me {
 							continue
 						}
-						if rf.matchIndex[peer] >= lastApeIndex {
+						if rf.matchIndex[peerId] >= lastApeIndex {
 							matchCnt++
 						}
 					}
 					if matchCnt > len(rf.peers)/2 && rf.log[lastApeIndex-rf.logStartIndex].Term == rf.currentTerm {
 						rf.commitIndex = lastApeIndex
 						rf.applyCond.Broadcast()
+						// fmt.Printf("could commit-idx%d--from follower-S%d,%d\n", lastApeIndex, peer, rf.log[lastApeIndex-rf.logStartIndex].Command)
 					}
 				}
 			} else {
 				if reply.Term > args.Term {
-					// fmt.Println("term problem")
 					// should use args.Term, not rf.currentTerm, because when rpc reply back, currentTerm may change
 					// which leads the program to unexpect branch
-					// fmt.Println(args.Term, rf.currentTerm)
-					//	fmt.Sprintf("My role is %d, my term is %d, but I reiecve term from : %d", rf.Role, rf.currentTerm, a.term))
-					rf.Role = follower
-					rf.currentTerm = reply.Term
-					rf.votedFor = -1
-					rf.persist(nil)
+					if reply.Term > rf.currentTerm {
+						// fmt.Printf("S%d My role is %d, my term is %d, but I reiecve term from : %d at preLog %d, len(log) %d\n", rf.me, rf.Role, rf.currentTerm, reply.Term, args.PrevLogIndex, len(args.Entries))
+						rf.Role = follower
+						rf.currentTerm = reply.Term
+						rf.votedFor = -1
+						rf.persist(nil)
 
-					rf.resetElectionTimer()
+						rf.resetElectionTimer()
+					}
 				} else {
-					// 处理不匹配的问题
-					// 重新给rpcArgs赋值，重新发送rpc
-					// fmt.Println("handling unMatch problem")
+					// handling unMatch problem
 					if reply.Xlen != -1 {
 						// XLen's problem
-						rf.nextIndex[peer] = reply.Xlen
+						rf.nextIndex[p] = reply.Xlen
 						// fmt.Printf("S%d handling unMatch len problem rf.nextIndex[%d]=%d,am I crash:%v %v\n", rf.me, peer, rf.nextIndex[peer], rf.killed(), time.Now().Format("15:04:05.000"))
 					} else {
 						left := 0
@@ -995,9 +940,9 @@ func (rf *Raft) sendAPE() {
 						}
 						if lastLogTerm != reply.Xterm {
 							// follower's conflict term not found in leader
-							rf.nextIndex[peer] = reply.Xindex
+							rf.nextIndex[p] = reply.Xindex
 						} else {
-							rf.nextIndex[peer] = left
+							rf.nextIndex[p] = left
 						}
 						// fmt.Printf("S%d handling unMatch Term problem rf.nextIndex[%d]=%d %v\n", rf.me, peer, rf.nextIndex[peer], time.Now().Format("15:04:05.000"))
 					}
