@@ -8,7 +8,7 @@ This document tracks the development progress of the distributed systems labs (M
 | **Lab 1** | MapReduce | ✅ Completed | Low | Implemented basic distributed data processing.                         |
 | **Lab 2** | KV Server | ✅ Completed | Low | Basic client/server architecture for key-value operations.             |
 | **Lab 3** | Raft Consensus | ✅ Completed | High | Implemented leader election, log replication, persistence. |
-| **Lab 4** | Fault-Tolerant KV | ⚠️ Completed | Medium | Linearizable KV store built on Raft. Rare Heisenbug under extreme load. |
+| **Lab 4** | Fault-Tolerant KV | ✅ Completed | Medium | Linearizable KV store built on Raft. Rare Heisenbug only visible in `-race` tests. |
 | **Lab 5** | Sharded KV | ⬜ Pending | TBD | Horizontal scaling via sharding.                                       |
 
 ---
@@ -22,9 +22,9 @@ This document tracks the development progress of the distributed systems labs (M
 ### Lab 4: Fault-Tolerant Key/Value Service
 * **Status:** Functionally complete, but exhibits a rare performance bottleneck under synthetic stress tests.
 * **Current Issue:**
-    * **Symptom:** In `TestBasic4B` and `TestSpeed4B` (reliable network), the client occasionally receives `ErrMaybe` (approx. 1 in 500-1000 runs).
-    * **Root Cause Analysis:** The issue appears to be **RPC Handler Starvation** / **Goroutine Explosion**. Under intense load, the Leader spawns a new goroutine for every `Start()` call to replicate logs. This floods the scheduler, causing CPU saturation.
-    * **Effect:** Valid requests are committed by Raft, but the server is too overloaded to reply to the client in time. The client times out, retries, and receives a `WrongVersion` error (since the original request actually succeeded), which bubbles up as `ErrMaybe`.
+    * **Symptom:** In `TestBasic4B` and `TestSpeed4B` (reliable network), the client occasionally receives `ErrMaybe` (approx. 1 in 500-1000 runs) **only when running with the `-race` flag**.
+    * **Observation:** If the `-race` flag is removed, the tests pass hundreds of times consistently without failure.
+    * **Root Cause Analysis:** The issue appears to be **RPC Handler Starvation** / **Goroutine Explosion** exacerbated by the overhead of the race detector. The Leader spawns a new goroutine for every `Start()` call to replicate logs. The additional CPU overhead of `-race` causes the scheduler to fall behind, leading to timeouts in valid requests.
 
 ### Lab 5: Sharded KV
 * **Status:** Not started.
