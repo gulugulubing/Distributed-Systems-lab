@@ -44,7 +44,7 @@ func (lk *Lock) Acquire() {
 				return
 			}
 			// purErr may be ErrVersion，ErrMaybe here, no possible for ErrNoKey, because version is 0
-			// ErrMaybe may be due to interleaving by others, maybe has acquired not lost reply and put again
+			// ErrMaybe may be due to interleaving by others, maybe has acquired but lost reply and put again
 			// if it is acquired, never mind, loop next round, this client will know it has acquired the lock
 		case rpc.OK:
 			// other client interleaving may occur here, if it happens, try again

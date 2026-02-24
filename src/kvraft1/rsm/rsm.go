@@ -170,8 +170,9 @@ func (rsm *RSM) reader() {
 			}
 			res := rsm.sm.DoOp(op.Req)
 
-			// Below are actually what should do only for leader or old leader
 			rsm.mu.Lock()
+			// if this rsm is not leader or not old leader(just a follower),
+			// ok will be false and skip pendingOp notify here
 			if pendingOp, ok := rsm.pendingOps[msg.CommandIndex]; ok {
 				if pendingOp.id == op.Id {
 					pendingOp.notify(res)
@@ -181,6 +182,7 @@ func (rsm *RSM) reader() {
 				}
 			}
 
+			// both leader and follower will do snapshot
 			if rsm.maxraftstate >= 0 && rsm.rf.PersistBytes() > rsm.maxraftstate {
 				index := msg.CommandIndex
 				snapshot := rsm.sm.Snapshot()

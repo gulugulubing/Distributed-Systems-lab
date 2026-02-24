@@ -38,7 +38,7 @@ func Key2Shard(key string) Tshid {
 type ShardConfig struct {
 	Num    Tnum                     // config number
 	Shards [NShards]tester.Tgid     // shard -> gid
-	Groups map[tester.Tgid][]string // gid -> servers[]
+	Groups map[tester.Tgid][]string // gid -> servers[], mapping never change, but size will?
 }
 
 func MakeShardConfig() *ShardConfig {

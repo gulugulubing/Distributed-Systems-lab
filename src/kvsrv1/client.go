@@ -75,7 +75,7 @@ func (ck *Clerk) Put(key, value string, version rpc.Tversion) rpc.Err {
 	sendCount := 0
 	for {
 		if ok := ck.clnt.Call(ck.server, "KVServer.Put", &args, &reply); !ok {
-			// log.Println("call KVServer.Put fail") // just print, keep going
+			//log.Println("call KVServer.Put fail") // just print, keep going
 			sendCount++
 			time.Sleep(100 * time.Millisecond)
 			continue

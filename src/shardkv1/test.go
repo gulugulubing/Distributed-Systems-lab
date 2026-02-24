@@ -140,6 +140,7 @@ func (ts *Test) join(sck *shardctrler.ShardCtrler, gid tester.Tgid, srvs []strin
 	if !ok {
 		log.Fatalf("join: group %d is already present", gid)
 	}
+	log.Printf("ctrler:%v changCfgJoin: %d\n", sck.Id(), newcfg.Num)
 	sck.ChangeConfigTo(newcfg)
 }
 
@@ -163,6 +164,7 @@ func (ts *Test) leave(sck *shardctrler.ShardCtrler, gid tester.Tgid) {
 	if !ok {
 		log.Fatalf("leave: group %d is already not present", gid)
 	}
+	log.Printf("ctrler:%v changCfgLeave: %d\n", sck.Id(), newcfg.Num)
 	sck.ChangeConfigTo(newcfg)
 }
 
@@ -366,15 +368,15 @@ func (ts *Test) concurCtrler(ck kvtest.IKVClerk, ka, va []string) {
 				ngid := ts.newGid()
 				sck := ts.makeShardCtrler()
 				sck.InitController()
-				//log.Printf("%v: electCtrler %d join/leave %v", sck.Id(), i, ngid)
+				log.Printf("%v: electCtrler %d join/leave %v", sck.Id(), i, ngid)
 				ts.joinGroups(sck, []tester.Tgid{ngid})
 				if ok := ts.checkMember(sck, ngid); ok {
-					//log.Printf("%v: electCtrler %d leave %d", sck.Id(), i, ngid)
+					log.Printf("%v: electCtrler %d leave %d", sck.Id(), i, ngid)
 					if ok := ts.leaveGroups(sck, []tester.Tgid{ngid}); !ok {
-						//log.Printf("%v: electCtrler %d leave %v failed", sck.Id(), i, ngid)
+						log.Printf("%v: electCtrler %d leave %v failed", sck.Id(), i, ngid)
 					}
 				} else {
-					//log.Printf("%v: electCtrler %d join %v failed", sck.Id(), i, ngid)
+					log.Printf("%v: electCtrler %d join %v failed", sck.Id(), i, ngid)
 				}
 			}
 		}
@@ -389,7 +391,7 @@ func (ts *Test) concurCtrler(ck kvtest.IKVClerk, ka, va []string) {
 	for i := 0; i < N; i++ {
 		ch <- struct{}{}
 	}
-
+	log.Println("........done checking kv ")
 	for i := 0; i < len(ka); i++ {
 		ts.CheckGet(ck, ka[i], va[i], rpc.Tversion(1))
 	}

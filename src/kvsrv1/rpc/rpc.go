@@ -9,11 +9,16 @@ const (
 	ErrVersion = "ErrVersion"
 
 	// Err returned by Clerk only
-	ErrMaybe = "ErrMaybe"
+	ErrMaybe       = "ErrMaybe"
+	ErrUnreachable = "ErrUnreachable"
 
 	// For future kvraft lab
 	ErrWrongLeader = "ErrWrongLeader"
 	ErrWrongGroup  = "ErrWrongGroup"
+
+	// For shardKv
+	ErrShardFrozen = "ErrShardFrozen"
+	ErrStaleNum    = "ErrStaleNum"
 )
 
 type Tversion uint64
@@ -37,4 +42,3 @@ type GetReply struct {
 	Version Tversion
 	Err     Err
 }
-
