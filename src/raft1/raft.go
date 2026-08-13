@@ -76,8 +76,6 @@ type Raft struct {
 	pendingSnapshot      []byte
 	pendingSnapshotIndex int
 	pendingSnapshotTerm  int
-
-	sendingAE []bool // Make follower not be flooded
 }
 
 func (rf *Raft) initRand() {
@@ -808,7 +806,7 @@ func (rf *Raft) processElectionResult(ch chan voteInfo) {
 			rf.mu.Unlock()
 
 		case <-timeout:
-			// No need to close ch here, go's gc will handle it
+			close(ch)
 			break
 		}
 	}
@@ -820,21 +818,7 @@ func (rf *Raft) sendAPE() {
 			continue
 		}
 
-		// If we are already sending to this peer, skip spawning a new goroutine!
-		// The active goroutine will naturally batch the new entries.
-		if rf.sendingAE[peer] {
-			continue
-		}
-		rf.sendingAE[peer] = true
-
 		go func(p int) {
-			// MUST release the flag when this goroutine exits
-			defer func() {
-				rf.mu.Lock()
-				rf.sendingAE[p] = false
-				rf.mu.Unlock()
-			}()
-
 			args := &AppendEntriesArgs{}
 			rf.mu.Lock()
 			if rf.Role != leader {
@@ -845,7 +829,6 @@ func (rf *Raft) sendAPE() {
 				// should send snap not APE
 				// fmt.Printf("S%d too slow,preLogIdx%d : logStartIdx %d %v\n", peer, args.PrevLogIndex, rf.logStartIndex, time.Now().Format("15:04:05.000"))
 				rf.mu.Unlock()
-				rf.sendInstallSnapshot(p)
 				return
 			}
 			args.Term = rf.currentTerm
@@ -996,8 +979,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.logStartIndex = 0
 	rf.applyCond = sync.NewCond(&rf.mu)
-
-	rf.sendingAE = make([]bool, len(peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
