@@ -453,23 +453,24 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
+	if args.Term < rf.currentTerm { // tell the sender it is not leader anymore
+		reply.Term = rf.currentTerm
+		reply.Success = false
+		rf.mu.Unlock()
+		return
+	}
+	if args.Term > rf.currentTerm { // discover a new term
+		if rf.Role != follower {
+			rf.Role = follower
+		}
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
+		rf.persist(nil)
+	}
+	rf.resetElectionTimer()
+
 	if args.Entries == nil { // This a heartBeat
-		if args.Term < rf.currentTerm { // tell the sender it is not leader anymore
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			rf.mu.Unlock()
-			return
-		}
-		if args.Term > rf.currentTerm { // discover a new term
-			if rf.Role != follower {
-				rf.Role = follower
-			}
-			rf.votedFor = -1
-			rf.currentTerm = args.Term
-			rf.persist(nil)
-		}
 		reply.Success = true
-		rf.resetElectionTimer()
 
 		if args.LeaderCommit < rf.logStartIndex+len(rf.log) && args.LeaderCommit-rf.logStartIndex >= 0 && args.LeaderCommitTerm == rf.log[args.LeaderCommit-rf.logStartIndex].Term {
 			if args.LeaderCommit > rf.commitIndex {
@@ -479,28 +480,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.mu.Unlock()
 	} else {
-		if args.Term < rf.currentTerm { // tell the sender: your term is too old
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			rf.mu.Unlock()
-			return
-		}
-
-		if args.Term > rf.currentTerm { // discover a new term
-			if rf.Role != follower {
-				rf.Role = follower
-				// fmt.Printf("S%d degradted to follower due recieve a new term %d to old term %d at %v\n", rf.Role, args.Term, rf.currentTerm, time.Now().Format("15:04:05.000"))
-				//tester.Annotate(fmt.Sprintf("Server %d", rf.me),
-				//	"degraded to follower",
-				//	fmt.Sprintf("reiecve APE with new term: %d", args.Term))
-			}
-			rf.votedFor = -1
-			rf.currentTerm = args.Term
-			rf.persist(nil)
-		}
-		rf.resetElectionTimer()
-		// then handle log
-
 		if args.PrevLogIndex >= len(rf.log)+rf.logStartIndex {
 			// My (follower's) log too short
 			// fmt.Printf("APE find S%d logLen+startIdx %d too short to PrveIndex %d %v\n", rf.me, len(rf.log)+rf.logStartIndex, args.PrevLogIndex, time.Now().Format("15:04:05"))
